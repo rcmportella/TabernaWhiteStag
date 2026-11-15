@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.pyc
+.vscode/
+test_*.py
+*_test.py
+savegame.json
+.save-*
