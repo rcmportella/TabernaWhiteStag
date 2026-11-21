@@ -13,7 +13,8 @@ from ability_generation import (
     METHOD_RANDOM,
     AbilityGenerator,
 )
-from character import Character
+from character import Character, PREPARED_SPELL_LIMITS
+from spell import SPELL_LIBRARY, SPELL_LISTS
 
 RESULT_NEXT = "next"
 RESULT_CANCEL = "cancel"
@@ -22,6 +23,9 @@ RESULT_QUIT = "quit"
 PORTRAIT_SIZE = (300, 300)
 PORTRAITS_DIR = Path(__file__).resolve().parent / "Resources" / "Portraits" / "Heroes"
 MAX_NAME_LENGTH = 20
+SPELL_LIST_RECT = pygame.Rect(440, 520, 460, 304)
+SPELL_ROW_HEIGHT = 38
+SPELL_VISIBLE_ROWS = SPELL_LIST_RECT.height // SPELL_ROW_HEIGHT
 
 GENDERS = (("Masculino", "M"), ("Feminino", "F"))
 # (label shown, class used by the Character rules)
@@ -137,6 +141,9 @@ class CharacterCreation:
         }
         self.abilities = AbilityGenerator()
         self.hits = []
+        self.selected_spell_ids = set()
+        self.spell_scroll = 0
+        self.spell_message = ""
 
     @property
     def char_class(self):
@@ -161,9 +168,42 @@ class CharacterCreation:
         return self.portraits[self.gender]
 
     def can_proceed(self):
-        return bool(self.name.strip()) and self.abilities.is_complete()
+        return (bool(self.name.strip()) and self.abilities.is_complete()
+                and len(self.selected_spell_ids) <= self.spell_limit()
+                and self.selected_spell_ids.issubset(self.spell_options()))
+
+    def spell_limit(self):
+        limits = PREPARED_SPELL_LIMITS.get(self.char_class)
+        return limits[0] if limits else 0
+
+    def spell_options(self):
+        if not self.spell_limit():
+            return []
+        return sorted(
+            (key for key in SPELL_LISTS[self.char_class] if SPELL_LIBRARY[key].level == 1),
+            key=lambda key: (SPELL_LIBRARY[key].name.casefold(), key),
+        )
+
+    def scroll_spells(self, step):
+        limit = max(0, len(self.spell_options()) - SPELL_VISIBLE_ROWS)
+        self.spell_scroll = max(0, min(limit, self.spell_scroll + step))
+
+    def toggle_spell(self, key):
+        if key not in self.spell_options():
+            raise ValueError(f"Magia indisponível para {self.char_class}: {key}")
+        if key in self.selected_spell_ids:
+            self.selected_spell_ids.remove(key)
+            self.spell_message = ""
+        elif len(self.selected_spell_ids) < self.spell_limit():
+            self.selected_spell_ids.add(key)
+            self.spell_message = ""
+        else:
+            self.spell_message = "Limite de magias preparadas atingido."
 
     def build_character(self):
+        if (len(self.selected_spell_ids) > self.spell_limit()
+                or not self.selected_spell_ids.issubset(self.spell_options())):
+            raise ValueError("Seleção de magias inválida para a classe")
         portrait_name, portrait = self.current_portraits()[self.portrait_index]
         character = Character(self.name.strip(), self.char_class)
         self.sync_alignment()
@@ -173,6 +213,12 @@ class CharacterCreation:
         character.portrait = portrait
         character.portrait_id = f"{self.gender}_{portrait_name}"
         character.add_gold(1000)
+        spells = [SPELL_LIBRARY[key] for key in self.spell_options()
+                  if key in self.selected_spell_ids]
+        for spell in spells:
+            character.learn_spell(spell)
+        if character.prepared_spell_limit:
+            character.prepare_spells(spells)
         return character
 
     def set_gender(self, gender):
@@ -254,7 +300,28 @@ class CharacterCreation:
         self.draw_text("Alinhamento", (440, 335))
         for dropdown in self.dropdowns.values():
             self.draw_dropdown(dropdown)
-        # Space below is reserved for upcoming attributes (e.g. proficiencies)
+        if self.spell_limit():
+            self.draw_spell_choices()
+
+    def draw_spell_choices(self):
+        self.draw_text("Magias preparadas (nível 1)", (440, 445))
+        self.draw_text(f"Selecionadas: {len(self.selected_spell_ids)}/{self.spell_limit()}",
+                       (440, 480))
+        options = self.spell_options()
+        for row, key in enumerate(options[self.spell_scroll:self.spell_scroll + SPELL_VISIBLE_ROWS]):
+            rect = (SPELL_LIST_RECT.x, SPELL_LIST_RECT.y + row * SPELL_ROW_HEIGHT,
+                    SPELL_LIST_RECT.width, SPELL_ROW_HEIGHT - 2)
+            self.button(rect, SPELL_LIBRARY[key].name, lambda k=key: self.toggle_spell(k),
+                        selected=key in self.selected_spell_ids)
+        if not options:
+            self.draw_text("Nenhuma magia disponível para esta classe.", (440, 530))
+        if len(options) > SPELL_VISIBLE_ROWS:
+            self.button((915, 520, 45, 40), "^", lambda: self.scroll_spells(-1),
+                        enabled=self.spell_scroll > 0)
+            self.button((915, 780, 45, 40), "v", lambda: self.scroll_spells(1),
+                        enabled=self.spell_scroll < len(options) - SPELL_VISIBLE_ROWS)
+        if self.spell_message:
+            self.draw_text(self.spell_message, (440, 840), color=GOLD)
 
     def draw_dropdown(self, dropdown):
         locked = dropdown.locked
@@ -359,6 +426,9 @@ class CharacterCreation:
             self.result = RESULT_QUIT
         elif self.open_dropdown():
             self.handle_dropdown_event(event, self.open_dropdown())
+        elif (event.type == pygame.MOUSEWHEEL and self.spell_limit()
+              and SPELL_LIST_RECT.collidepoint(pygame.mouse.get_pos())):
+            self.scroll_spells(-event.y)
         elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             for rect, action in self.hits:
                 if rect.collidepoint(event.pos):
@@ -380,6 +450,10 @@ class CharacterCreation:
         elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             value = dropdown.option_at(event.pos)
             if value is not None:
+                if dropdown is self.dropdowns["class"] and value != dropdown.value:
+                    self.selected_spell_ids.clear()
+                    self.spell_scroll = 0
+                    self.spell_message = ""
                 dropdown.value = value
             dropdown.is_open = False
         elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:

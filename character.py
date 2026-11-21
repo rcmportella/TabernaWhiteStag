@@ -1,18 +1,50 @@
 """
 Character system following OGL D20 rules
 """
+from enum import Flag, auto
 import dice
-from equipment import Armor, Equipment, Potion, Shield, Weapon
+from equipment import (
+    Armor, Equipment, HolySymbol, HolyWater, Potion, RationPack, Ring, Shield, Weapon,
+    holy_symbol,
+)
+from spell import SPELL_LIBRARY
 
 
 # Classes that can only have a specific alignment
 CLASS_ALIGNMENT_RESTRICTIONS = {"Paladin": "Lawful Good"}
+
+PREPARED_SPELL_LIMITS = {
+    "Wizard": (4, 5, 6, 7, 9, 10, 11, 12, 14, 15, 16, 16, 17, 18, 19, 21, 22, 23, 24, 25),
+    "Cleric": (4, 5, 6, 7, 9, 10, 11, 12, 14, 15, 16, 16, 17, 17, 18, 18, 19, 20, 21, 22),
+    "Sorcerer": (2, 4, 6, 7, 9, 10, 11, 12, 14, 15, 16, 16, 17, 17, 18, 18, 19, 20, 21, 22),
+    "Paladin": (2, 3, 4, 5, 6, 6, 7, 7, 9, 9, 10, 10, 11, 11, 12, 12, 14, 14, 15, 15),
+    "Ranger": (2, 3, 4, 5, 6, 6, 7, 7, 9, 9, 10, 10, 11, 11, 12, 12, 14, 14, 15, 15),
+}
+
+class Condition(Flag):
+    NONE = 0
+    BLINDED = auto()
+    CHARMED = auto()
+    DEAFENED = auto()
+    FRIGHTENED = auto()
+    GRAPPLED = auto()
+    INCAPACITATED = auto()
+    INVISIBLE = auto()
+    PARALYZED = auto()
+    PETRIFIED = auto()
+    POISONED = auto()
+    PRONE = auto()
+    RESTRAINED = auto()
+    STUNNED = auto()
+    UNCONSCIOUS = auto()
+    DEAD = auto()
 
 
 class Character:
     """
     Player character with D20 attributes and stats
     """
+    creature_type = "humanoid"
     
     def __init__(self, name, char_class="Fighter", level=1):
         self.name = name
@@ -36,6 +68,7 @@ class Character:
         # Combat stats
         self.max_hp = 10
         self.current_hp = 10
+        self.temporary_hp = 0
         self.base_attack_bonus = 0
         self._armor_class_bonus = 0
         
@@ -49,16 +82,37 @@ class Character:
         self.equipped_weapon = None
         self.equipped_armor = None
         self.equipped_shield = None
+        self.equipped_ring_left = None
+        self.equipped_ring_right = None
+        if self.char_class in ("Paladin", "Cleric"):
+            self.add_item(holy_symbol())
         
         # Spells (for spellcasting classes)
         self.known_spells = []
+        self.prepared_spells = []
+        self.always_prepared_spells = []
+        self.preparation_replacements = 0  # None means unrestricted after a long rest
         self.spell_slots = {}  # {level: available_slots}
-        
+        # Paladin-specific spell setup
+        self.layonhands_pool = 0  # Simplified pool of hit points for Lay on Hands
+        if self.char_class == "Paladin":
+            self.learn_spell(SPELL_LIBRARY["lay_on_hands"])
         # Experience and wealth
         self.experience = 0
         self.gold = 0
+
+        # Conditions and death state
+        self.conditions = Condition.NONE
+        self.dying = False          # True enquanto está fazendo death saves
+        self.stable = False         # True após 3 sucessos, ainda unconscious
+        self.death_successes = 0
+        self.death_failures = 0
+        self.death_save_dc = 10     # o número que precisa tirar no d20
         
-    @staticmethod
+        # Initialize derived stats (HP, spell slots, etc)
+        self._update_derived_stats()
+        
+
     def required_alignment(char_class):
         """Alignment imposed by the class, or None if unrestricted"""
         return CLASS_ALIGNMENT_RESTRICTIONS.get(char_class)
@@ -106,6 +160,20 @@ class Character:
             self.fortitude_save = 2 + (self.level // 2)
             self.reflex_save = 0 + (self.level // 3)
             self.will_save = 0 + (self.level // 3)
+            self.layonhands_pool = 5 * self.level
+            self._setup_paladin_spells()
+        elif self.char_class == "Barbarian":
+            self.max_hp = 12 + con_mod + (self.level - 1) * (6 + con_mod)
+            self.base_attack_bonus = self.level
+            self.fortitude_save = 2 + (self.level // 2)
+            self.reflex_save = 0 + (self.level // 3)
+            self.will_save = 0 + (self.level // 3)
+        elif self.char_class == "Ranger":
+            self.max_hp = 10 + con_mod + (self.level - 1) * (6 + con_mod)
+            self.base_attack_bonus = self.level
+            self.fortitude_save = 2 + (self.level // 2)
+            self.reflex_save = 0 + (self.level // 3)
+            self.will_save = 0 + (self.level // 3)
         elif self.char_class == "Wizard":
             self.max_hp = 4 + con_mod + (self.level - 1) * (3 + con_mod)
             self.base_attack_bonus = self.level // 2
@@ -113,6 +181,13 @@ class Character:
             self.reflex_save = 0 + (self.level // 3)
             self.will_save = 2 + (self.level // 2)
             self._setup_wizard_spells()
+        elif self.char_class == "Sorcerer":
+            self.max_hp = 4 + con_mod + (self.level - 1) * (3 + con_mod)
+            self.base_attack_bonus = self.level // 2
+            self.fortitude_save = 0 + (self.level // 3)
+            self.reflex_save = 0 + (self.level // 3)
+            self.will_save = 2 + (self.level // 2)
+            self._setup_sorcerer_spells()
         elif self.char_class == "Rogue":
             self.max_hp = 6 + con_mod + (self.level - 1) * (4 + con_mod)
             self.base_attack_bonus = (self.level * 3) // 4
@@ -137,25 +212,49 @@ class Character:
         """Setup spell slots for wizard"""
         # Simplified spell slots per level
         slots_per_level = {
-            1: {0: 3, 1: 1},
-            2: {0: 3, 1: 2},
-            3: {0: 3, 1: 2, 2: 1},
-            4: {0: 4, 1: 3, 2: 2},
-            5: {0: 4, 1: 3, 2: 2, 3: 1}
+            1: {0: 3, 1: 2},
+            2: {0: 3, 1: 3},
+            3: {0: 3, 1: 4, 2: 2},
+            4: {0: 4, 1: 4, 2: 3},
+            5: {0: 4, 1: 4, 2: 3, 3: 2}
         }
-        self.spell_slots = slots_per_level.get(self.level, {0: 3, 1: 1})
+        self.spell_slots = slots_per_level.get(self.level, {0: 4, 1: 4, 2: 3, 3: 2})
         
     def _setup_cleric_spells(self):
         """Setup spell slots for cleric"""
         # Simplified spell slots per level
         slots_per_level = {
-            1: {0: 3, 1: 1},
-            2: {0: 4, 1: 2},
-            3: {0: 4, 1: 2, 2: 1},
-            4: {0: 5, 1: 3, 2: 2},
-            5: {0: 5, 1: 3, 2: 2, 3: 1}
+            1: {0: 3, 1: 2},
+            2: {0: 3, 1: 3},
+            3: {0: 3, 1: 4, 2: 2},
+            4: {0: 5, 1: 4, 2: 3},
+            5: {0: 5, 1: 4, 2: 3, 3: 2}
         }
         self.spell_slots = slots_per_level.get(self.level, {0: 3, 1: 1})
+
+    def _setup_sorcerer_spells(self):
+        """Setup spell slots for sorcerer"""
+        # Simplified spell slots per level
+        slots_per_level = {
+            1: {0: 4, 1: 2},
+            2: {0: 4, 1: 3},
+            3: {0: 4, 1: 4, 2: 2},
+            4: {0: 5, 1: 4, 2: 3},
+            5: {0: 5, 1: 4, 2: 3, 3: 2}
+        }
+        self.spell_slots = slots_per_level.get(self.level, {0: 4, 1: 4, 2: 3, 3: 2})
+
+    def _setup_paladin_spells(self):
+        """Setup spell slots for paladin"""
+        # Simplified spell slots per level
+        slots_per_level = {
+            1: {0: 1, 1: 2},
+            2: {0: 2, 1: 2},
+            3: {0: 2, 1: 3},
+            4: {0: 2, 1: 3},
+            5: {0: 2, 1: 4, 2: 2}
+        }
+        self.spell_slots = slots_per_level.get(self.level, {0: 3, 1: 3, 2: 2})
         
     def get_ability_modifier(self, ability):
         """Get the modifier for an ability score"""
@@ -176,12 +275,20 @@ class Character:
     @armor_class.setter
     def armor_class(self, value):
         shield_bonus = self.equipped_shield.ac_bonus if self.equipped_shield else 0
-        self._armor_class_bonus = value - self._base_armor_class() - shield_bonus
+        self._armor_class_bonus = value - self._base_armor_class() - shield_bonus - self._ring_armor_bonus()
+
+    def _ring_armor_bonus(self):
+        bonuses = {}
+        for ring in (self.equipped_ring_left, self.equipped_ring_right):
+            if ring is not None:
+                key = ring.name.casefold()
+                bonuses[key] = max(bonuses.get(key, 0), ring.ac_bonus)
+        return sum(bonuses.values())
 
     def get_armor_class(self):
         """Calculate AC from the equipped armor and other modifiers."""
         shield_bonus = self.equipped_shield.ac_bonus if self.equipped_shield else 0
-        return self._base_armor_class() + shield_bonus + self._armor_class_bonus
+        return self._base_armor_class() + shield_bonus + self._ring_armor_bonus() + self._armor_class_bonus
     
     def get_weapon_damage(self):
         """
@@ -249,19 +356,136 @@ class Character:
         sides = int(sides)
         
         return dice.roll(sides, count, mod)
-        
+
+    def _enter_dying(self):
+        """Muda para o estado de morte quando o HP chega a 0."""
+        if self.is_dead:
+            return
+        self.dying = True
+        self.stable = False
+        self.death_successes = 0
+        self.death_failures = 0
+        self.conditions |= Condition.UNCONSCIOUS
+        self.conditions |= Condition.INCAPACITATED
+
     def take_damage(self, damage):
         """Take damage and return True if still alive"""
+        if damage<=0:
+            return self.current_hp > 0
+        
+        # Temporary HP absorb damage first
+        if self.temporary_hp > 0:
+            absorbed = min(self.temporary_hp, damage)
+            self.temporary_hp -= absorbed
+            damage -= absorbed
+            # If all damage was absorbed by temporary HP, return early
+            if damage == 0:
+                return self.current_hp > 0
+            
+        # Remaining damage is applied to current HP
         self.current_hp -= damage
+        if self.current_hp <= 0:
+            self.current_hp = 0
+            self._enter_dying()
         return self.current_hp > 0
         
+    def roll_death_save(self):
+        """Rola um death saving throw. Retorna (sucesso: bool, estabilizou: bool, morreu: bool).
+
+        Só deve ser chamado quando self.dying é True. O loop de combate chama
+        uma vez por turno do personagem.
+        """
+        if not self.dying:
+            return None, False, False
+
+        roll = dice.d20()                      # d20 puro, sem modificadores
+        if roll >= self.death_save_dc:
+            self.death_successes += 1
+            success = True
+        else:
+            self.death_failures += 1
+            success = False
+
+        # 20 natural: recupera 1 HP imediatamente (regra opcional, mas comum)
+        if roll == 20:
+            self._stabilize(heal=1)
+            return True, True, False
+
+        # 1 natural: conta como duas falhas
+        if roll == 1:
+            self.death_failures += 1
+
+        if self.death_failures >= 3:
+            self._die()
+            return False, False, True
+
+        if self.death_successes >= 3:
+            self._stabilize()
+            return True, True, False
+
+        return success, False, False
+
+    def _stabilize(self, heal=0):
+        """Personagem estabiliza: para de morrer, fica unconscious."""
+        self.dying = False
+        self.stable = True
+        self.death_successes = 0
+        self.death_failures = 0
+        if heal:
+            self.current_hp = heal
+        # UNCONSCIOUS e INCAPACITATED permanecem até o fim do combate / cura
+        self.conditions |= Condition.UNCONSCIOUS
+        self.conditions |= Condition.INCAPACITATED
+
+    def _die(self):
+        """Personagem morre."""
+        self.dying = False
+        self.stable = False
+        self.current_hp = 0
+        self.conditions = Condition.DEAD  # morto não tem outras condições
+
+    def end_combat(self):
+        """Restaura o personagem estabilizado ao final do combate."""
+        if self.stable and not self.is_dead:
+            self.current_hp = 1
+            self.stable = False
+            self.conditions &= ~Condition.UNCONSCIOUS
+            self.conditions &= ~Condition.INCAPACITATED
+
     def heal(self, amount):
-        """Heal damage, capped at max HP"""
+        if self.is_dead:
+            return                          # morto não cura
         self.current_hp = min(self.current_hp + amount, self.max_hp)
+        if self.current_hp > 0 and self.dying:
+            self.dying = False
+            self.stable = False
+            self.death_successes = 0
+            self.death_failures = 0
+            self.conditions &= ~Condition.UNCONSCIOUS
+            self.conditions &= ~Condition.INCAPACITATED
+
+    def add_temporary_hp(self, amount):
+        """Add temporary hit points, replacing any existing temporary HP if higher"""
+        if amount <= 0:
+            return self.temporary_hp
         
+        # Temporary HP do not stack; only the highest value is kept
+        if amount > self.temporary_hp:
+            self.temporary_hp = amount
+            
+        return self.temporary_hp
+
     def is_alive(self):
         """Check if character is still alive"""
         return self.current_hp > 0
+
+    @property
+    def is_dead(self):
+        return bool(self.conditions & Condition.DEAD)
+
+    @property
+    def is_unconscious(self):
+        return bool(self.conditions & Condition.UNCONSCIOUS)
         
     def saving_throw(self, save_type):
         """
@@ -288,19 +512,35 @@ class Character:
             raise ValueError("This equipment is already in the inventory")
         if isinstance(item, Potion) and item.used:
             raise ValueError("A used potion cannot be added to inventory")
+        if isinstance(item, HolyWater) and item.used:
+            raise ValueError("Used holy water cannot be added to inventory")
         self.inventory.append(item)
 
-    def equip(self, item):
-        """Equip a weapon, armor or shield already in the inventory."""
-        if not isinstance(item, (Weapon, Armor, Shield)):
-            raise TypeError("Only weapons, armor and shields can be equipped")
+    def equip(self, item, slot=None):
+        """Equip an inventory item; rings require a ring_left or ring_right slot."""
+        if not isinstance(item, (Weapon, Armor, Shield, Ring)):
+            raise TypeError("Only weapons, armor, shields and rings can be equipped")
         if not any(existing is item for existing in self.inventory):
             raise ValueError("Equipment must be in the inventory")
+        if isinstance(item, Ring):
+            if slot not in ("ring_left", "ring_right"):
+                raise ValueError("A ring must be equipped in ring_left or ring_right")
+            other = "ring_right" if slot == "ring_left" else "ring_left"
+            if getattr(self, f"equipped_{other}") is item:
+                setattr(self, f"equipped_{other}", None)
+            setattr(self, f"equipped_{slot}", item)
+            return
+        if slot is not None:
+            raise ValueError("Only rings accept an explicit slot")
         if isinstance(item, Weapon):
+            if item.two_handed:
+                self.unequip_shield()
             self.equipped_weapon = item
         elif isinstance(item, Armor):
             self.equipped_armor = item
         else:
+            if isinstance(self.equipped_weapon, Weapon) and self.equipped_weapon.two_handed:
+                self.unequip_weapon()
             self.equipped_shield = item
 
     def unequip_weapon(self):
@@ -311,6 +551,11 @@ class Character:
 
     def unequip_shield(self):
         self.equipped_shield = None
+
+    def unequip_ring(self, slot):
+        if slot not in ("ring_left", "ring_right"):
+            raise ValueError("Ring slot must be ring_left or ring_right")
+        setattr(self, f"equipped_{slot}", None)
     
     def add_gold(self, amount):
         """Add gold to character's wealth"""
@@ -336,6 +581,21 @@ class Character:
                 if item.lower() == item_name.lower():
                     count += 1
         return count
+
+    def remove_item(self, item):
+        """Remove a particular inventory object and unequip it if necessary."""
+        for index, existing in enumerate(self.inventory):
+            if existing is item:
+                self.inventory.pop(index)
+                self._unequip_missing_items()
+                return
+        raise ValueError("Item is not in the inventory")
+
+    def _unequip_missing_items(self):
+        for slot in ("weapon", "armor", "shield", "ring_left", "ring_right"):
+            item = getattr(self, f"equipped_{slot}")
+            if item is not None and not any(existing is item for existing in self.inventory):
+                setattr(self, f"equipped_{slot}", None)
     
     def remove_items(self, item_name, quantity):
         """Remove a specific quantity of items. Returns True if successful, False if not enough."""
@@ -358,38 +618,100 @@ class Character:
                     new_inventory.append(item)
             
             self.inventory = new_inventory
-            if not any(item is self.equipped_weapon for item in self.inventory):
-                self.unequip_weapon()
-            if not any(item is self.equipped_armor for item in self.inventory):
-                self.unequip_armor()
-            if not any(item is self.equipped_shield for item in self.inventory):
-                self.unequip_shield()
+            self._unequip_missing_items()
             return True
         return False
         
     def use_item(self, item_name, target=None):
         """Use an inventory item on the character or on the specified target."""
-        if target is None:
-            target = self
         for item in self.inventory:
             if getattr(item, 'name', '').lower() == item_name.lower():
-                if not callable(getattr(item, 'use', None)):
-                    raise TypeError(f"{item.name} cannot be used as a consumable")
-                effect = item.use(target)
-                if item.consumable:
-                    self.inventory.remove(item)
-                return effect
+                return self.use_inventory_item(item, target)
         return None
+
+    def use_inventory_item(self, item, target=None):
+        """Use a specific inventory object on this character or a target."""
+        if not any(existing is item for existing in self.inventory):
+            raise ValueError("Item is not in the inventory")
+        if not callable(getattr(item, 'use', None)):
+            raise TypeError(f"{item.name} cannot be used as a consumable")
+        effect = item.use(self if target is None else target)
+        if item.consumable and not (isinstance(item, RationPack) and item.quantity > 0):
+            self.remove_item(item)
+        return effect
         
     def learn_spell(self, spell):
         """Learn a new spell"""
         if spell not in self.known_spells:
             self.known_spells.append(spell)
+
+    def has_holy_symbol(self):
+        """Check if the character has a Holy Symbol in inventory"""
+        return any(isinstance(item, HolySymbol) for item in self.inventory)
+
+    @property
+    def prepared_spell_limit(self):
+        limits = PREPARED_SPELL_LIMITS.get(self.char_class)
+        if limits is None:
+            return 0
+        if not 1 <= self.level <= len(limits):
+            raise ValueError("Prepared spell limits are defined for levels 1-20")
+        return limits[self.level - 1]
+
+    def prepare_spells(self, spells):
+        """Replace the complete list of ordinary prepared spells atomically."""
+        spells = list(spells)
+        if self.char_class not in PREPARED_SPELL_LIMITS:
+            raise ValueError("This class does not have prepared spells")
+        if len(spells) > self.prepared_spell_limit:
+            raise ValueError("Prepared spell limit exceeded")
+        if len(set(spells)) != len(spells):
+            raise ValueError("A spell cannot be prepared twice")
+        for spell in spells:
+            if spell not in self.known_spells or spell.level < 1:
+                raise ValueError("Only known level 1+ spells can be prepared")
+            if spell in self.always_prepared_spells:
+                raise ValueError("This spell is already always prepared")
+            max_level = (min(5, (self.level + 3) // 4)
+                         if self.char_class in ("Paladin", "Ranger")
+                         else min(9, (self.level + 1) // 2))
+            if spell.level > max_level:
+                raise ValueError("Spell level is too high for this character")
+        removed = sum(spell not in spells for spell in self.prepared_spells)
+        if len(spells) < len(self.prepared_spells):
+            raise ValueError("Prepared spells must be replaced, not removed")
+        if self.preparation_replacements is not None and removed > self.preparation_replacements:
+            raise ValueError("Prepared spells cannot be replaced now")
+        self.prepared_spells = spells
+        if removed:
+            if self.preparation_replacements is None:
+                self.preparation_replacements = 0
+            else:
+                self.preparation_replacements -= removed
+
+    def grant_always_prepared_spell(self, spell):
+        """Grant a spell that does not count against the preparation limit."""
+        if spell.level < 1:
+            raise ValueError("Cantrips do not need preparation")
+        self.learn_spell(spell)
+        if spell in self.prepared_spells:
+            self.prepared_spells.remove(spell)
+        if spell not in self.always_prepared_spells:
+            self.always_prepared_spells.append(spell)
             
     def can_cast_spell(self, spell):
         """Check if character can cast a spell"""
         if spell not in self.known_spells:
             return False
+        if (self.char_class in PREPARED_SPELL_LIMITS and spell.level > 0
+                and spell not in self.prepared_spells
+                and spell not in self.always_prepared_spells):
+            return False
+        # Holy Symbol check for Clerics and Paladins
+        if self.char_class in ("Cleric", "Paladin"):
+            components = getattr(spell, 'components', ())
+            if 'M' in components and not self.has_holy_symbol():
+                return False  # Needs a holy symbol to cast material spells  
         spell_level = spell.level
         return self.spell_slots.get(spell_level, 0) > 0
         
@@ -414,7 +736,25 @@ class Character:
         """Long rest to restore all HP and spell slots"""
         self.current_hp = self.max_hp
         self._update_derived_stats()  # Restore spell slots
-        
+        if self.char_class in ("Wizard", "Cleric"):
+            self.preparation_replacements = None
+        elif self.char_class in ("Paladin", "Ranger"):
+            self.preparation_replacements = 1
+        if not self.is_dead:
+            self.dying = False
+            self.stable = False
+            self.death_successes = 0
+            self.death_failures = 0
+            self.conditions = Condition.NONE  # remove todas as condições, inclusive poisons
+
+    def can_act(self):
+        """False se o personagem não pode realizar ações no turno."""
+        if self.is_dead:
+            return False
+        if self.conditions & (Condition.UNCONSCIOUS | Condition.PARALYZED | Condition.STUNNED):
+            return False
+        return True
+
     def rest(self):
         """Alias for long_rest for backward compatibility"""
         self.long_rest()
@@ -430,6 +770,8 @@ class Character:
         """Level up the character"""
         self.level += 1
         self._update_derived_stats()
+        if self.char_class == "Sorcerer":
+            self.preparation_replacements = 1
     
     def get_character_sheet(self, detailed=True):
         """
@@ -493,6 +835,14 @@ class Character:
                 sheet += f"\nKNOWN SPELLS ({len(self.known_spells)}):\n"
                 for spell in self.known_spells:
                     sheet += f"  - {spell.name}\n"
+            if self.char_class in PREPARED_SPELL_LIMITS:
+                sheet += f"\nPREPARED SPELLS ({len(self.prepared_spells)}/{self.prepared_spell_limit}):\n"
+                for spell in self.prepared_spells:
+                    sheet += f"  - {spell.name}\n"
+                for spell in self.always_prepared_spells:
+                    sheet += f"  - {spell.name} (always prepared)\n"
+            if self.conditions:
+                sheet += f"\nCONDITIONS: {', '.join(c.name for c in Condition if self.conditions & c)}\n"
             
             sheet += "=" * 60
             return sheet

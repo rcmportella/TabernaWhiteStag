@@ -7,12 +7,19 @@ def main() -> None:
     import pygame
 
     from character_creation import (
+        BUTTON,
+        GOLD,
         RESULT_NEXT,
         RESULT_QUIT,
+        TEXT,
         run_character_creation,
     )
+    from pause_menu import BOX, NO_BUTTON, YES_BUTTON
     from tavern import Tavern
-    from savegame import SAVE_PATH, SaveError, load_game as load_saved_game
+    from savegame import (
+        SAVE_PATH, SaveError, last_saved_slot, load_game as load_saved_game, slot_exists, slot_path,
+    )
+    from save_slots import SlotSelector
 
     background_dir = (
         Path(__file__).resolve().parent / "Resources" / "Background"
@@ -53,6 +60,8 @@ def main() -> None:
     }
 
     game = None
+    slot_selector = None
+    pending_continue_slot = None
     menu_message = ""
     message_font = pygame.font.Font(None, 28)
 
@@ -73,6 +82,25 @@ def main() -> None:
         if menu_message:
             message = message_font.render(menu_message, True, (255, 215, 160))
             window.blit(message, (30, 30))
+        if slot_selector is not None:
+            slot_selector.draw()
+        if pending_continue_slot is not None:
+            shade = pygame.Surface(window.get_size(), pygame.SRCALPHA)
+            shade.fill((0, 0, 0, 180))
+            window.blit(shade, (0, 0))
+            pygame.draw.rect(window, (20, 14, 10), BOX, border_radius=8)
+            pygame.draw.rect(window, GOLD, BOX, 2, border_radius=8)
+            for text, y in (
+                (f"Carregar o último salvamento (slot {pending_continue_slot})?", 370),
+                ("O progresso em memória será perdido.", 405),
+            ):
+                image = message_font.render(text, True, TEXT)
+                window.blit(image, image.get_rect(center=(768, y)))
+            for rect, label in ((YES_BUTTON, "Sim"), (NO_BUTTON, "Não")):
+                pygame.draw.rect(window, BUTTON, rect, border_radius=6)
+                pygame.draw.rect(window, GOLD, rect, 2, border_radius=6)
+                image = message_font.render(label, True, TEXT)
+                window.blit(image, image.get_rect(center=rect.center))
         pygame.display.flip()
 
     def run_game() -> None:
@@ -92,24 +120,58 @@ def main() -> None:
             return
         if result == RESULT_NEXT:
             game = Tavern(window, character)
+            game.open_theron_dialogue()
             menu_message = ""
             run_game()
         else:
             draw_menu()
 
     def continue_game() -> None:
-        run_game()
+        nonlocal menu_message, pending_continue_slot
+        try:
+            slot = last_saved_slot(SAVE_PATH.parent)
+        except (SaveError, OSError) as exc:
+            menu_message = f"Erro ao identificar o último salvamento: {exc}"
+            draw_menu()
+            return
+        if slot is None:
+            menu_message = "Nenhum jogo salvo encontrado."
+            draw_menu()
+        elif game is not None:
+            pending_continue_slot = slot
+            draw_menu()
+        else:
+            load_slot(slot)
 
     def load_game() -> None:
-        nonlocal game, menu_message
+        nonlocal slot_selector
+        slot_selector = SlotSelector(window, SAVE_PATH.parent, "carregar")
+        draw_menu()
+
+    def load_slot(slot: int) -> None:
+        nonlocal game, menu_message, slot_selector
+        path = slot_path(slot, SAVE_PATH.parent)
         try:
-            state = load_saved_game(SAVE_PATH)
+            if not slot_exists(path):
+                message = f"O slot {slot} está vazio."
+                if slot_selector is None:
+                    menu_message = message
+                else:
+                    slot_selector.message = message
+                draw_menu()
+                return
+            state = load_saved_game(path)
         except (SaveError, OSError, pygame.error) as exc:
-            menu_message = f"Erro ao carregar: {exc}"
+            if slot_selector is None:
+                menu_message = f"Erro ao carregar: {exc}"
+            else:
+                slot_selector.message = f"Erro ao carregar: {exc}"
             draw_menu()
             return
         game = Tavern(window, state.hero)
         game.apply_state(state)
+        game.save_slot = slot
+        slot_selector = None
         menu_message = ""
         run_game()
 
@@ -130,6 +192,25 @@ def main() -> None:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
+                elif not animating and pending_continue_slot is not None:
+                    if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                        pending_continue_slot = None
+                        draw_menu()
+                    elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                        if NO_BUTTON.collidepoint(event.pos):
+                            pending_continue_slot = None
+                            draw_menu()
+                        elif YES_BUTTON.collidepoint(event.pos):
+                            slot = pending_continue_slot
+                            pending_continue_slot = None
+                            load_slot(slot)
+                elif not animating and slot_selector is not None:
+                    selection = slot_selector.handle_event(event)
+                    if selection == "cancel":
+                        slot_selector = None
+                        draw_menu()
+                    elif isinstance(selection, int):
+                        load_slot(selection)
                 elif (
                     not animating
                     and event.type == pygame.MOUSEBUTTONDOWN

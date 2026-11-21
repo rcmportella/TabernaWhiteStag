@@ -10,7 +10,10 @@ from character import Character
 from character_creation import (
     BUTTON, BUTTON_DISABLED, GOLD, RESULT_CANCEL, RESULT_NEXT, RESULT_QUIT, TEXT,
 )
-from equipment import Armor, Equipment, HealingPotion, RationPack, Shield, Weapon
+from equipment import (
+    Armor, Equipment, HealingPotion, RationPack, Ring, Shield, Weapon,
+    dagger, greataxe, ring_of_protection, rope,
+)
 
 RESOURCE_DIR = Path(__file__).resolve().parent / "Resources"
 
@@ -18,20 +21,32 @@ RESOURCE_DIR = Path(__file__).resolve().parent / "Resources"
 @dataclass(frozen=True)
 class ShopItem:
     label: str
-    image: str
     factory: Callable[[], Equipment]
     slot: str
 
 
 CATALOG = (
-    ShopItem("Espada longa", "Longsword.png",
-             lambda: Weapon("Longsword", 50, 3, "1d8", "slashing"), "weapon"),
-    ShopItem("Peitoral", "Breastplate.png",
+    ShopItem("Espada longa",
+             lambda: Weapon("Longsword", 15, 3, "1d8", "slashing"), "weapon"),
+    ShopItem("Adaga",
+             dagger, "weapon"),
+    ShopItem("Espada curta",
+             lambda: Weapon("Shortsword", 10, 2, "1d6", "piercing", finesse=True), "weapon"),
+    ShopItem("Machado grande",
+             greataxe, "weapon"),
+    ShopItem("Peitoral",
              lambda: Armor("Breastplate", 400, 20, 14, "medium"), "armor"),
-    ShopItem("Escudo kite (+3 CA)", "KiteShield.png",
+    ShopItem("Escudo Pipa (+3 CA)",
              lambda: Shield("Kite Shield", 100, 6, 3), "shield"),
-    ShopItem("Poção de cura", "HealingPotion.png", HealingPotion, "backpack"),
-    ShopItem("Rações (10)", "Ration.png", RationPack, "backpack"),
+    ShopItem("Armadura de couro",
+             lambda: Armor("Leather Armor", 10, 10, 11, "light"), "armor"),
+    ShopItem("Escudo redondo (+2 CA)",
+             lambda: Shield("Round Shield", 10, 6, 2), "shield"),
+    ShopItem("Anel de Proteção +1", ring_of_protection, "ring_left"),
+    ShopItem("Anel de Proteção +1", ring_of_protection, "ring_right"),
+    ShopItem("Poção de cura", HealingPotion, "backpack"),
+    ShopItem("Rações (10)", RationPack, "backpack"),
+    ShopItem("Corda", rope, "backpack"),
 )
 
 # The background has no weapon or shield spaces; those are drawn separately.
@@ -52,8 +67,9 @@ SLOTS = {
 }
 BACK_BUTTON = pygame.Rect(80, 935, 200, 50)
 NEXT_BUTTON = pygame.Rect(1256, 935, 200, 50)
-LIST_RECT = pygame.Rect(478, 305, 580, 355)
+LIST_RECT = pygame.Rect(570, 305, 580, 520)
 ROW_HEIGHT = 105
+VISIBLE_ROWS = (LIST_RECT.height - 90) // ROW_HEIGHT
 
 
 class EquipmentShop:
@@ -63,34 +79,44 @@ class EquipmentShop:
         self.background = pygame.image.load(
             str(RESOURCE_DIR / "Background" / "Equipar.png")
         ).convert()
-        self.images = {
-            entry.image: pygame.transform.smoothscale(
-                pygame.image.load(str(RESOURCE_DIR / "Items" / entry.image))
-                .convert_alpha(), (88, 88)
-            )
-            for entry in CATALOG
-        }
+        self.images: dict[Path, pygame.Surface] = {}
         self.font = pygame.font.Font(None, 30)
         self.small_font = pygame.font.Font(None, 25)
         self.title_font = pygame.font.Font(None, 40)
         self.open_slot = None
+        self.option_scroll = 0
         self.message = ""
         self.result = None
         self.initial_gold = character.gold
         self.initial_inventory = list(character.inventory)
         self.initial_equipment = (
             character.equipped_weapon, character.equipped_armor,
-            character.equipped_shield,
+            character.equipped_shield, character.equipped_ring_left,
+            character.equipped_ring_right,
         )
 
     def options(self):
         return [entry for entry in CATALOG if entry.slot == self.open_slot]
+
+    def scroll_options(self, step):
+        limit = max(0, len(self.options()) - VISIBLE_ROWS)
+        self.option_scroll = max(0, min(limit, self.option_scroll + step))
+
+    def open_slot_at(self, pos):
+        for key, (_, rect) in SLOTS.items():
+            if rect.collidepoint(pos):
+                self.open_slot = key
+                self.option_scroll = 0
+                self.message = ""
+                return
 
     def owned(self, entry):
         return {
             "weapon": self.character.equipped_weapon,
             "armor": self.character.equipped_armor,
             "shield": self.character.equipped_shield,
+            "ring_left": self.character.equipped_ring_left,
+            "ring_right": self.character.equipped_ring_right,
         }.get(entry.slot) is not None
 
     def buy(self, entry):
@@ -103,14 +129,22 @@ class EquipmentShop:
             return
         self.character.add_item(item)
         if entry.slot != "backpack":
-            self.character.equip(item)
+            previous_weapon = self.character.equipped_weapon
+            previous_shield = self.character.equipped_shield
+            self.character.equip(item, entry.slot if isinstance(item, Ring) else None)
         self.message = f"{entry.label} comprado."
+        if entry.slot != "backpack":
+            if previous_shield is not None and self.character.equipped_shield is None:
+                self.message += " Escudo desequipado."
+            elif previous_weapon is not None and self.character.equipped_weapon is None:
+                self.message += " Arma desequipada."
 
     def rollback(self):
         self.character.gold = self.initial_gold
         self.character.inventory = self.initial_inventory[:]
         (self.character.equipped_weapon, self.character.equipped_armor,
-         self.character.equipped_shield) = self.initial_equipment
+         self.character.equipped_shield, self.character.equipped_ring_left,
+         self.character.equipped_ring_right) = self.initial_equipment
 
     def text(self, text, pos, font=None, color=TEXT, center=False):
         surface = (font or self.font).render(text, True, color)
@@ -121,6 +155,20 @@ class EquipmentShop:
         pygame.draw.rect(self.window, BUTTON, rect, border_radius=6)
         pygame.draw.rect(self.window, GOLD, rect, 2, border_radius=6)
         self.text(label, rect.center, center=True)
+
+    def draw_item_image(self, item, rect):
+        path = item.image
+        if path is None:
+            pygame.draw.rect(self.window, BUTTON_DISABLED, rect)
+            pygame.draw.rect(self.window, GOLD, rect, 1)
+            self.text("Sem", (rect.centerx, rect.centery - 10), self.small_font, center=True)
+            self.text("imagem", (rect.centerx, rect.centery + 10), self.small_font, center=True)
+            return
+        if path not in self.images:
+            self.images[path] = pygame.transform.smoothscale(
+                pygame.image.load(str(path)).convert_alpha(), (88, 88)
+            )
+        self.window.blit(self.images[path], rect)
 
     def draw(self):
         self.window.blit(self.background, (0, 0))
@@ -133,17 +181,26 @@ class EquipmentShop:
             pygame.draw.rect(self.window, (20, 14, 10), rect)
             pygame.draw.rect(self.window, GOLD, rect, 2)
 
-        for entry in CATALOG[:3]:
-            if self.owned(entry):
-                rect = SLOTS[entry.slot][1]
-                self.window.blit(self.images[entry.image],
-                                 self.images[entry.image].get_rect(center=rect.center))
-        for index, entry in enumerate(CATALOG[3:]):
-            count = self.character.count_item(entry.factory().name)
-            if count:
-                pos = (1188 + index * 108, 230)
-                self.window.blit(self.images[entry.image], pos)
-                self.text(f"x{count}", (pos[0] + 44, pos[1] + 97), center=True)
+        for slot in ("weapon", "armor", "shield", "ring_left", "ring_right"):
+            item = getattr(self.character, f"equipped_{slot}")
+            if item is not None:
+                rect = SLOTS[slot][1]
+                self.draw_item_image(item, pygame.Rect(0, 0, 88, 88).move(
+                    rect.centerx - 44, rect.centery - 44))
+        backpack_items = []
+        for entry in CATALOG:
+            if entry.slot == "backpack":
+                item = entry.factory()
+                count = self.character.count_item(item.name)
+                if count:
+                    backpack_items.append((item, count))
+        for index, (item, count) in enumerate(backpack_items[:4]):
+            pos = (1188 + (index % 2) * 108, 230 + (index // 2) * 110)
+            self.draw_item_image(item, pygame.Rect(*pos, 88, 88))
+            self.text(f"x{count}", (pos[0] + 44, pos[1] + 97), center=True)
+        if len(backpack_items) > 4:
+            self.text(f"+{len(backpack_items) - 4} tipos",
+                      (SLOTS["backpack"][1].centerx, 180), self.small_font, GOLD, True)
 
         if self.message:
             self.text(self.message, (768, 918), self.small_font, GOLD, True)
@@ -157,19 +214,23 @@ class EquipmentShop:
         pygame.draw.rect(self.window, GOLD, LIST_RECT, 2, border_radius=6)
         self.text(SLOTS[self.open_slot][0], (LIST_RECT.x + 20, LIST_RECT.y + 15),
                   self.title_font, GOLD)
-        self.text("Clique para comprar   |   Esc: fechar",
+        self.text("Clique para comprar   |   Roda: rolar   |   Esc: fechar",
                   (LIST_RECT.x + 20, LIST_RECT.y + 55), self.small_font)
         options = self.options()
         if not options:
             self.text("Nenhum equipamento disponível.", (LIST_RECT.x + 20, LIST_RECT.y + 115))
-        for index, entry in enumerate(options):
+        for index, entry in enumerate(options[self.option_scroll:self.option_scroll + VISIBLE_ROWS]):
             rect = self.row_rect(index)
             item = entry.factory()
             disabled = self.owned(entry) or self.character.gold < item.cost
             pygame.draw.rect(self.window, BUTTON_DISABLED if disabled else BUTTON, rect)
-            self.window.blit(self.images[entry.image], (rect.x + 5, rect.y + 5))
+            self.draw_item_image(item, pygame.Rect(rect.x + 5, rect.y + 5, 88, 88))
             self.text(entry.label, (rect.x + 108, rect.y + 14))
-            status = "Equipado" if self.owned(entry) else f"{item.cost:g} po"
+            equipped = getattr(self.character, f"equipped_{entry.slot}", None)
+            if self.owned(entry):
+                status = "Equipado" if equipped.name == item.name else "Espaço ocupado"
+            else:
+                status = f"{item.cost:g} po"
             if not self.owned(entry) and self.character.gold < item.cost:
                 status += " — ouro insuficiente"
             self.text(status, (rect.x + 108, rect.y + 51), self.small_font, GOLD)
@@ -194,20 +255,22 @@ class EquipmentShop:
         elif self.open_slot:
             if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                 self.open_slot = None
+            elif event.type == pygame.KEYDOWN and event.key in (pygame.K_UP, pygame.K_DOWN):
+                self.scroll_options(-1 if event.key == pygame.K_UP else 1)
+            elif event.type == pygame.MOUSEWHEEL:
+                self.scroll_options(-event.y)
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 if not LIST_RECT.collidepoint(event.pos):
                     self.open_slot = None
+                    self.open_slot_at(event.pos)
                 else:
-                    for index, entry in enumerate(self.options()):
+                    options = self.options()[self.option_scroll:self.option_scroll + VISIBLE_ROWS]
+                    for index, entry in enumerate(options):
                         if self.row_rect(index).collidepoint(event.pos):
                             self.buy(entry)
                             break
         elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            for key, (_, rect) in SLOTS.items():
-                if rect.collidepoint(event.pos):
-                    self.open_slot = key
-                    self.message = ""
-                    break
+            self.open_slot_at(event.pos)
 
     def run(self):
         clock = pygame.time.Clock()

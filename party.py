@@ -2,6 +2,7 @@
 Party management system for the player's group of characters
 """
 from character import Character
+from equipment import Equipment
 
 
 class Party:
@@ -67,6 +68,22 @@ class Party:
     def total_gold(self):
         """Get total gold from all party members"""
         return sum(m.gold for m in self.members)
+
+    def purchase_item(self, item: Equipment, recipient: Character) -> bool:
+        """Buy an item with shared gold, giving it to a party member."""
+        if recipient not in self.members:
+            raise ValueError("Recipient must be a party member")
+        if self.total_gold() < item.cost:
+            return False
+        recipient.add_item(item)
+        remaining = item.cost
+        for member in self.members:
+            contribution = min(max(member.gold, 0), remaining)
+            member.gold -= contribution
+            remaining -= contribution
+            if remaining <= 0:
+                break
+        return True
         
     def distribute_gold(self, amount):
         """Distribute gold evenly among party members"""
